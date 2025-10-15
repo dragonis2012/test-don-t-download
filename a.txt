@@ -6,84 +6,150 @@ import threading
 import numpy as np
 import pyaudio
 import time
+import miniupnpc # Pour la redirection de port automatique
 
-# --- Configuration du Réseau et des Flux ---
-SERVER_IP_STREAM = '93.28.230.141' # L'adresse IP spécifiée pour le streaming
-PORT_STREAM_VIDEO = 9999         # Port pour le flux vidéo (UDP)
-PORT_STREAM_AUDIO = 9998         # Port pour le flux audio (UDP) - On utilise un port séparé pour l'audio pour simplifier
-PORT_CONTROL = 9997              # Port pour les commandes de contrôle (TCP)
-CHUNK_SIZE = 1024                # Taille des chunks audio
-RATE = 44100                     # Taux d'échantillonnage audio
-FORMAT = pyaudio.paInt16         # Format audio
-CHANNELS = 1                     # Nombre de canaux audio
+# --- CONFIGURATION DES PORTS ET DES PROTOCOLES ---
+# IMPORTANT : Mettez votre IP PUBLIQUE ICI si vous voulez que les clients externes se connectent
+SERVER_IP_STREAM = '93.28.230.141' 
+PORT_STREAM_VIDEO = 9999
+PORT_STREAM_AUDIO = 9998
+PORT_CONTROL = 9997
 
-# Variables de contrôle de l'état
+# Configuration audio (Doit correspondre au client)
+CHUNK_SIZE = 1024
+RATE = 44100
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+
+UPNP_LEASE_TIME = 60*60*4 # Durée du bail de redirection de port (4 heures)
+
+# --- VARIABLES GLOBALES ET LOCK ---
 current_camera_index = 0
 current_mic_index = 0
 streaming_active = True
 lock = threading.Lock()
 
-# --- Initialisation des sources multimédias ---
+# Initialisation de PyAudio
 p = pyaudio.PyAudio()
 
+# --- FONCTIONS DE DÉCOUVERTE DE PÉRIPHÉRIQUES ---
+
 def get_device_names(device_type):
-    """Liste les noms des appareils (caméras ou micros)."""
+    """Détecte les caméras disponibles (jusqu'à 5) ou les microphones."""
     devices = []
     if device_type == 'camera':
-        # OpenCV ne liste pas les noms, on fait une estimation par index
-        for i in range(5): # Essayer les 5 premiers indices
+        for i in range(5):
             cap = cv2.VideoCapture(i)
             if cap.isOpened():
                 devices.append(f"Caméra {i}")
                 cap.release()
-            else:
-                if i > 0: break # Arrêter si le premier indice qui ne fonctionne pas n'est pas 0
+            elif i > 0: # S'arrête après le premier échec si i > 0
+                 break
         return devices
     elif device_type == 'micro':
-        info = p.get_host_api_info_by_index(0)
-        numdevices = info.get('deviceCount')
-        for i in range(0, numdevices):
-            if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-                devices.append(p.get_device_info_by_host_api_device_index(0, i).get('name'))
+        try:
+            info = p.get_host_api_info_by_index(0)
+            numdevices = info.get('deviceCount')
+            for i in range(0, numdevices):
+                if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
+                    devices.append(p.get_device_info_by_host_api_device_index(0, i).get('name'))
+        except Exception as e:
+            print(f"Erreur lors de la détection des microphones: {e}")
         return devices
     return []
 
-# Listes disponibles au démarrage
+# Détection des périphériques au démarrage
 AVAILABLE_CAMERAS = get_device_names('camera')
 AVAILABLE_MICS = get_device_names('micro')
 
 if not AVAILABLE_CAMERAS:
     print("ATTENTION: Aucune caméra trouvée.")
-    # On peut créer un flux noir si aucune caméra n'est trouvée
     AVAILABLE_CAMERAS.append("Flux noir (par défaut)")
 if not AVAILABLE_MICS:
     print("ATTENTION: Aucun microphone trouvé.")
     AVAILABLE_MICS.append("Flux muet (par défaut)")
 
-# --- Fonctions de Streaming ---
+# --- FONCTIONS UPnP (REDIRECTION DE PORT) ---
+
+def map_ports(ports):
+    """Tente de mapper les ports UDP et TCP en utilisant UPnP."""
+    u = None
+    try:
+        print("^[UPnP] Recherche de l'Internet Gateway Device (IGD)...")
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 200
+        if u.discover() > 0:
+            u.selectigd()
+            ip = u.lanaddr
+            print(f"^[UPnP] IGD trouvé. IP locale: {ip}")
+            
+            for port, protocol in ports:
+                print(f"^[UPnP] Tentative de mappage du port {port} ({protocol})...")
+                
+                # Supprimer le mappage existant (si nécessaire)
+                u.deleteportmapping(port, protocol) 
+                
+                # Ajouter un nouveau mappage
+                # On utilise la fonction 'getdevicestatus' de miniupnpc comme un moyen d'obtenir
+                # une valeur (non utilisée) pour le bail, bien que la valeur UPNP_LEASE_TIME soit plus appropriée
+                # Pour plus de robustesse, on utilise 0 (permanent) ou UPNP_LEASE_TIME
+                success = u.addportmapping(
+                    port, # Port externe
+                    protocol, # Protocole ('TCP' ou 'UDP')
+                    ip, # IP interne
+                    port, # Port interne
+                    f"ServeurStream_{port}", # Description
+                    UPNP_LEASE_TIME, # Durée du bail en secondes
+                )
+                
+                if success:
+                    print(f"^[UPnP] Mappage du port {port} réussi (IP externe: {u.externalipaddress}).")
+                else:
+                    print(f"^[UPnP] Echec du mappage du port {port}.")
+        else:
+            print("^[UPnP] Aucun IGD trouvé. Le mappage de port manuel peut être nécessaire.")
+
+    except Exception as e:
+        print(f"^[UPnP] Erreur lors de l'opération UPnP: {e}")
+
+def unmap_ports(ports):
+    """Supprime les mappages de port UPnP lors de l'arrêt."""
+    try:
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 200
+        if u.discover() > 0:
+            u.selectigd()
+            print("^[UPnP] Suppression des mappages de port...")
+            for port, protocol in ports:
+                u.deleteportmapping(port, protocol)
+                print(f"^[UPnP] Port {port} démappé.")
+    except Exception as e:
+        # Ignore les erreurs de suppression, le serveur s'arrête
+        pass 
+        
+# --- THREADS DE STREAMING ---
 
 def video_streamer():
-    """Capture et envoie le flux vidéo."""
+    """Gère la capture et le streaming vidéo via UDP."""
     global current_camera_index, streaming_active
-    
-    # Créer le socket UDP
     server_socket_video = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     while streaming_active:
         cap = None
         with lock:
             cam_idx = current_camera_index
-        
-        if cam_idx < len(AVAILABLE_CAMERAS) - 1: # Si ce n'est pas le flux noir
+
+        # Tente d'ouvrir la caméra si ce n'est pas le flux par défaut (index -1 ou >= nombre de caméras)
+        if cam_idx < len(AVAILABLE_CAMERAS) - 1 and cam_idx >= 0:
             cap = cv2.VideoCapture(cam_idx)
             if not cap.isOpened():
                 print(f"Erreur: Impossible d'ouvrir la caméra {cam_idx}. Passage à la source par défaut.")
-                cap = None # Force le passage au flux noir
-        
-        # Boucle de capture et d'envoi
+                cap = None
+
         while streaming_active:
             with lock:
-                if cam_idx != current_camera_index: # Changement de source demandé
+                # Vérifie si la source a été changée par la commande de contrôle
+                if cam_idx != current_camera_index:
                     if cap: cap.release()
                     break
 
@@ -94,44 +160,46 @@ def video_streamer():
                     if cap: cap.release()
                     break
             else:
-                # Générer une image noire de 640x480 avec texte
+                # Flux noir par défaut
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, f"Pas de Camera {cam_idx}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            
-            # Réduire la résolution et encoder pour l'envoi
-            frame = cv2.resize(frame, (320, 240)) 
+                cv2.putText(frame, f"Pas de Caméra ({cam_idx})", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Traitement de la frame
+            frame = cv2.resize(frame, (320, 240))
             result, frame_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
             data = pickle.dumps(frame_encoded, 0)
             size = len(data)
 
-            # Empaquetage de la taille et des données
             try:
                 msg = struct.pack(">L", size) + data
                 server_socket_video.sendto(msg, (SERVER_IP_STREAM, PORT_STREAM_VIDEO))
             except Exception as e:
-                print(f"Erreur d'envoi vidéo: {e}")
+                # Ignorer les erreurs d'envoi si le client est déconnecté
                 time.sleep(0.1)
-                
-            time.sleep(0.033) # Tenter ~30 FPS
+
+            time.sleep(0.033) # Limite à environ 30 FPS
 
         if cap: cap.release()
-        
+        time.sleep(1) # Délai avant la prochaine tentative de capture
+
 def audio_streamer():
-    """Capture et envoie le flux audio."""
+    """Gère la capture et le streaming audio via UDP."""
     global current_mic_index, streaming_active
     server_socket_audio = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
+
     while streaming_active:
         stream = None
+        input_device_index = None
         with lock:
             mic_idx = current_mic_index
-        
+
         try:
+            # Tente d'ouvrir le micro
             mic_info = p.get_device_info_by_index(mic_idx)
             input_device_index = mic_idx
             if mic_info.get('maxInputChannels') == 0:
                  raise ValueError("Appareil sans entrée micro.")
-                 
+
             stream = p.open(format=FORMAT,
                             channels=CHANNELS,
                             rate=RATE,
@@ -141,61 +209,69 @@ def audio_streamer():
             print(f"Streaming audio démarré: {AVAILABLE_MICS[mic_idx]}")
 
         except Exception as e:
+            # Si le micro ne s'ouvre pas, on enverra du silence
             print(f"Erreur: Impossible d'ouvrir le micro {mic_idx} ({e}). Envoi de données muettes.")
-            input_device_index = None # Pas de capture réelle
+            input_device_index = None
 
-        # Boucle de capture et d'envoi
         while streaming_active:
             with lock:
+                # Vérifie si la source a été changée
                 if mic_idx != current_mic_index:
                     if stream: stream.close()
                     break
 
-            audio_data = b'\x00' * CHUNK_SIZE * p.get_sample_size(FORMAT) # Données muettes par défaut
+            audio_data = b'\x00' * CHUNK_SIZE * p.get_sample_size(FORMAT) # Silence
             if stream and input_device_index is not None:
                 try:
                     audio_data = stream.read(CHUNK_SIZE)
                 except IOError as e:
-                    # Gérer le buffer overflow ou la déconnexion
+                    # Gère le débordement de buffer ou l'erreur de lecture
                     print(f"Erreur de lecture audio: {e}. Reconnexion.")
                     if stream: stream.close()
-                    break # Redémarrer la boucle externe pour relancer le micro
+                    break
 
             try:
                 server_socket_audio.sendto(audio_data, (SERVER_IP_STREAM, PORT_STREAM_AUDIO))
             except Exception as e:
-                print(f"Erreur d'envoi audio: {e}")
-                time.sleep(0.01) # Petite pause en cas d'erreur
-        
-        if stream: stream.close()
-        time.sleep(1) # Petite pause avant de réessayer/changer
+                # Ignorer les erreurs d'envoi si le client est déconnecté
+                time.sleep(0.01)
 
-# --- Thread de Contrôle TCP ---
+        if stream: stream.close()
+        time.sleep(1) # Délai avant la prochaine tentative d'ouverture du micro
+
+# --- SERVEUR DE CONTRÔLE (TCP) ---
 
 def control_server():
-    """Écoute les commandes de contrôle du client via TCP."""
+    """Gère la connexion TCP pour les commandes de contrôle (changement de source)."""
     global current_camera_index, current_mic_index, streaming_active
-    
-    # Créer le socket TCP
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    control_sock.bind(('0.0.0.0', PORT_CONTROL)) # Écouter sur toutes les interfaces
-    control_sock.listen(1)
-    print(f"\n[Contrôle] Serveur de contrôle en écoute sur le port {PORT_CONTROL}")
+    control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        control_sock.bind(('0.0.0.0', PORT_CONTROL))
+        control_sock.listen(1)
+        print(f"^[Contrôle] Serveur de contrôle en écoute sur le port {PORT_CONTROL}")
+    except Exception as e:
+        print(f"^[Contrôle] ERREUR: Impossible de lier le port {PORT_CONTROL}: {e}")
+        streaming_active = False
+        return
 
     try:
         conn, addr = control_sock.accept()
-        print(f"[Contrôle] Connexion établie avec {addr}")
-        
+        print(f"^[Contrôle] Connexion établie avec {addr}")
+
         while streaming_active:
             try:
+                conn.settimeout(0.5) # Timeout pour vérifier streaming_active
                 command = conn.recv(1024).decode().strip()
-                if not command:
-                    print("[Contrôle] Client déconnecté.")
-                    break
                 
+                if not command:
+                    print("^[Contrôle] Client déconnecté.")
+                    break
+
                 parts = command.split(':')
                 cmd_type = parts[0]
-                
+
                 with lock:
                     if cmd_type == 'CAM':
                         try:
@@ -207,7 +283,7 @@ def control_server():
                                 response = f"ERREUR: Index de caméra invalide {new_index}"
                         except:
                             response = "ERREUR: Format de commande CAM invalide"
-                    
+
                     elif cmd_type == 'MIC':
                         try:
                             new_index = int(parts[1])
@@ -218,39 +294,64 @@ def control_server():
                                 response = f"ERREUR: Index de micro invalide {new_index}"
                         except:
                             response = "ERREUR: Format de commande MIC invalide"
-                    
+
                     elif cmd_type == 'LIST':
                         cam_list = ",".join(f"{i}:{name}" for i, name in enumerate(AVAILABLE_CAMERAS))
                         mic_list = ",".join(f"{i}:{name}" for i, name in enumerate(AVAILABLE_MICS))
                         response = f"LIST:CAM={cam_list}|MIC={mic_list}"
                         
+                    elif cmd_type == 'STATUS':
+                        # CORRECTION : Ajout de la gestion STATUS pour corriger le bug client
+                        if len(parts) > 1:
+                            if parts[1] == 'CAM':
+                                response = f"STATUS:{current_camera_index}"
+                            elif parts[1] == 'MIC':
+                                response = f"STATUS:{current_mic_index}"
+                            else:
+                                response = "ERREUR: Statut inconnu"
+                        else:
+                            response = "ERREUR: Format de commande STATUS invalide"
+
                     else:
                         response = "ERREUR: Commande inconnue"
 
                 conn.sendall(response.encode())
-                print(f"[Contrôle] Reçu: {command} -> Envoyé: {response.split(':')[0]}")
+                print(f"^[Contrôle] Reçu: {command} -> Envoyé: {response.split(':')[0]}")
 
+            except socket.timeout:
+                # Se produit si aucune donnée n'est reçue pendant le timeout, permet la boucle while
+                continue
             except ConnectionResetError:
-                print("[Contrôle] Client forcé à se déconnecter.")
+                print("^[Contrôle] Client forcé à se déconnecter.")
                 break
             except Exception as e:
-                print(f"[Contrôle] Erreur de communication: {e}")
+                print(f"^[Contrôle] Erreur de communication: {e}")
                 break
-    
+
     finally:
         control_sock.close()
-        streaming_active = False # Arrêter le streaming si le contrôle se termine
+        streaming_active = False # Arrête tous les threads
 
-# --- Fonction principale du serveur ---
+# --- POINT D'ENTRÉE PRINCIPAL ---
 
 if __name__ == '__main__':
     print(f"--- Serveur de Streaming Multi-Source ---")
+    
+    # ----------------------------------------------------
+    # Configuration des ports pour UPnP
+    PORTS_TO_MAP = [
+        (PORT_STREAM_VIDEO, 'UDP'), 
+        (PORT_STREAM_AUDIO, 'UDP'),
+        (PORT_CONTROL, 'TCP')
+    ]
+    map_ports(PORTS_TO_MAP) # Tente le mappage UPnP
+    # ----------------------------------------------------
+    
     print(f"IP de streaming: {SERVER_IP_STREAM}")
     print(f"Port Vidéo (UDP): {PORT_STREAM_VIDEO}")
     print(f"Port Audio (UDP): {PORT_STREAM_AUDIO}")
     print(f"Port de Contrôle (TCP): {PORT_CONTROL}\n")
 
-    # Démarrer les threads
     video_thread = threading.Thread(target=video_streamer)
     audio_thread = threading.Thread(target=audio_streamer)
     control_thread = threading.Thread(target=control_server)
@@ -260,13 +361,19 @@ if __name__ == '__main__':
     control_thread.start()
 
     try:
-        # Maintenir le thread principal en vie jusqu'à ce que les threads se terminent
+        # Attend que le thread de contrôle se termine (ou jusqu'à l'interruption)
         control_thread.join()
     except KeyboardInterrupt:
-        print("\nArrêt du serveur par l'utilisateur.")
+        print("\nArrêt du serveur par l'utilisateur (Ctrl+C).")
     finally:
         streaming_active = False
-        # Permettre aux autres threads de s'arrêter
+        # Permet aux threads de se terminer proprement
         video_thread.join(timeout=1)
         audio_thread.join(timeout=1)
+        
+        # ----------------------------------------------------
+        # Suppression des mappages UPnP
+        unmap_ports(PORTS_TO_MAP) 
+        # ----------------------------------------------------
+        
         print("Serveur arrêté.")
