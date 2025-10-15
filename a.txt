@@ -38,12 +38,15 @@ def get_device_names(device_type):
     """Détecte les caméras disponibles (jusqu'à 5) ou les microphones."""
     devices = []
     if device_type == 'camera':
+        # Tente d'ouvrir les 5 premiers indices
         for i in range(5):
-            cap = cv2.VideoCapture(i)
+            # Utilisation de CAP_DSHOW pour une meilleure détection sur Windows
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) 
             if cap.isOpened():
                 devices.append(f"Caméra {i}")
                 cap.release()
             elif i > 0:
+                 # S'arrête après le premier échec (i>0) pour ne pas attendre trop longtemps
                  break
         return devices
     elif device_type == 'micro':
@@ -85,10 +88,8 @@ def map_ports(ports):
             for port, protocol in ports:
                 print(f"^[UPnP] Tentative de mappage du port {port} ({protocol})...")
                 
-                # Supprimer le mappage existant (si nécessaire)
                 u.deleteportmapping(port, protocol) 
                 
-                # Ajouter un nouveau mappage
                 success = u.addportmapping(
                     port, # Port externe
                     protocol, # Protocole ('TCP' ou 'UDP')
@@ -135,9 +136,16 @@ def video_streamer():
             cam_idx = current_camera_index
 
         if cam_idx < len(AVAILABLE_CAMERAS) - 1 and cam_idx >= 0:
-            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+            # Tente d'ouvrir avec CAP_DSHOW pour une meilleure compatibilité (Camo, etc.)
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW) 
+            
+            if cap.isOpened():
+                # Tente de forcer le codec MJPG pour une meilleure stabilité
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+                cap.set(cv2.CAP_PROP_FPS, 30)
+            
             if not cap.isOpened():
-                print(f"Erreur: Impossible d'ouvrir la caméra {cam_idx}. Passage à la source par défaut.")
+                print(f"Erreur: Impossible d'ouvrir la caméra {cam_idx} (CAP_DSHOW + MJPG). Passage à la source par défaut.")
                 cap = None
 
         while streaming_active:
@@ -286,7 +294,7 @@ def control_server():
                         response = f"LIST:CAM={cam_list}|MIC={mic_list}"
                         
                     elif cmd_type == 'STATUS':
-                        # CORRECTION DU BUG CLIENT
+                        # Correction du bug client
                         if len(parts) > 1:
                             if parts[1] == 'CAM':
                                 response = f"STATUS:{current_camera_index}"
@@ -354,4 +362,3 @@ if __name__ == '__main__':
         unmap_ports(PORTS_TO_MAP) 
         
         print("Serveur arrêté.")
-
