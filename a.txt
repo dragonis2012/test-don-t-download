@@ -1,83 +1,272 @@
-# a_txt_rewrite.py (remplace a.txt)
+import cv2
 import socket
-import struct
 import pickle
-import json
+import struct
 import threading
-import time
-from pygrabber.dshow_graph import FilterGraph
+import numpy as np
 import pyaudio
+import time
 
-HOST = "93.28.230.141"
-PORT = 9999
+# --- Configuration du Réseau et des Flux ---
+SERVER_IP_STREAM = '93.28.230.141' # L'adresse IP spécifiée pour le streaming
+PORT_STREAM_VIDEO = 9999         # Port pour le flux vidéo (UDP)
+PORT_STREAM_AUDIO = 9998         # Port pour le flux audio (UDP) - On utilise un port séparé pour l'audio pour simplifier
+PORT_CONTROL = 9997              # Port pour les commandes de contrôle (TCP)
+CHUNK_SIZE = 1024                # Taille des chunks audio
+RATE = 44100                     # Taux d'échantillonnage audio
+FORMAT = pyaudio.paInt16         # Format audio
+CHANNELS = 1                     # Nombre de canaux audio
 
-# Audio config
-A_CHUNK = 1024
-A_FORMAT = pyaudio.paInt16
-A_CHANNELS = 1
-A_RATE = 44100
+# Variables de contrôle de l'état
+current_camera_index = 0
+current_mic_index = 0
+streaming_active = True
+lock = threading.Lock()
 
+# --- Initialisation des sources multimédias ---
 p = pyaudio.PyAudio()
-out_stream = p.open(format=A_FORMAT, channels=A_CHANNELS, rate=A_RATE, output=True)
 
-# Liste des caméras disponibles
-graph = FilterGraph()
-cams = graph.get_input_devices()
-print("Caméras détectées :", cams)
+def get_device_names(device_type):
+    """Liste les noms des appareils (caméras ou micros)."""
+    devices = []
+    if device_type == 'camera':
+        # OpenCV ne liste pas les noms, on fait une estimation par index
+        for i in range(5): # Essayer les 5 premiers indices
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                devices.append(f"Caméra {i}")
+                cap.release()
+            else:
+                if i > 0: break # Arrêter si le premier indice qui ne fonctionne pas n'est pas 0
+        return devices
+    elif device_type == 'micro':
+        info = p.get_host_api_info_by_index(0)
+        numdevices = info.get('deviceCount')
+        for i in range(0, numdevices):
+            if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
+                devices.append(p.get_device_info_by_host_api_device_index(0, i).get('name'))
+        return devices
+    return []
 
-# choix par défaut
-current = {"cam_index": 0, "mic_index": None}
+# Listes disponibles au démarrage
+AVAILABLE_CAMERAS = get_device_names('camera')
+AVAILABLE_MICS = get_device_names('micro')
 
-def recv_settings(conn):
-    while True:
-        try:
-            hdr = conn.recv(1)
-            if not hdr:
-                break
-            if hdr == b'S':
-                ldata = conn.recv(2)
-                if not ldata:
+if not AVAILABLE_CAMERAS:
+    print("ATTENTION: Aucune caméra trouvée.")
+    # On peut créer un flux noir si aucune caméra n'est trouvée
+    AVAILABLE_CAMERAS.append("Flux noir (par défaut)")
+if not AVAILABLE_MICS:
+    print("ATTENTION: Aucun microphone trouvé.")
+    AVAILABLE_MICS.append("Flux muet (par défaut)")
+
+# --- Fonctions de Streaming ---
+
+def video_streamer():
+    """Capture et envoie le flux vidéo."""
+    global current_camera_index, streaming_active
+    
+    # Créer le socket UDP
+    server_socket_video = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    while streaming_active:
+        cap = None
+        with lock:
+            cam_idx = current_camera_index
+        
+        if cam_idx < len(AVAILABLE_CAMERAS) - 1: # Si ce n'est pas le flux noir
+            cap = cv2.VideoCapture(cam_idx)
+            if not cap.isOpened():
+                print(f"Erreur: Impossible d'ouvrir la caméra {cam_idx}. Passage à la source par défaut.")
+                cap = None # Force le passage au flux noir
+        
+        # Boucle de capture et d'envoi
+        while streaming_active:
+            with lock:
+                if cam_idx != current_camera_index: # Changement de source demandé
+                    if cap: cap.release()
                     break
-                slen = struct.unpack("H", ldata)[0]
-                payload = conn.recv(slen)
-                obj = json.loads(payload.decode('utf-8'))
-                current['cam_index'] = obj.get('cam_index', 0)
-                current['mic_index'] = obj.get('mic_index', None)
-                print("[SERVER] Settings reçus :", current)
+
+            if cap and cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    print("Erreur: Impossible de lire la frame. Redémarrage de la capture.")
+                    if cap: cap.release()
+                    break
+            else:
+                # Générer une image noire de 640x480 avec texte
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, f"Pas de Camera {cam_idx}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # Réduire la résolution et encoder pour l'envoi
+            frame = cv2.resize(frame, (320, 240)) 
+            result, frame_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+            data = pickle.dumps(frame_encoded, 0)
+            size = len(data)
+
+            # Empaquetage de la taille et des données
+            try:
+                msg = struct.pack(">L", size) + data
+                server_socket_video.sendto(msg, (SERVER_IP_STREAM, PORT_STREAM_VIDEO))
+            except Exception as e:
+                print(f"Erreur d'envoi vidéo: {e}")
+                time.sleep(0.1)
+                
+            time.sleep(0.033) # Tenter ~30 FPS
+
+        if cap: cap.release()
+        
+def audio_streamer():
+    """Capture et envoie le flux audio."""
+    global current_mic_index, streaming_active
+    server_socket_audio = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    while streaming_active:
+        stream = None
+        with lock:
+            mic_idx = current_mic_index
+        
+        try:
+            mic_info = p.get_device_info_by_index(mic_idx)
+            input_device_index = mic_idx
+            if mic_info.get('maxInputChannels') == 0:
+                 raise ValueError("Appareil sans entrée micro.")
+                 
+            stream = p.open(format=FORMAT,
+                            channels=CHANNELS,
+                            rate=RATE,
+                            input=True,
+                            frames_per_buffer=CHUNK_SIZE,
+                            input_device_index=input_device_index)
+            print(f"Streaming audio démarré: {AVAILABLE_MICS[mic_idx]}")
+
         except Exception as e:
-            print("[SERVER] recv_settings_loop erreur:", e)
-            break
+            print(f"Erreur: Impossible d'ouvrir le micro {mic_idx} ({e}). Envoi de données muettes.")
+            input_device_index = None # Pas de capture réelle
 
-def send_video_audio(conn):
-    # capture caméra via pygrabber
-    cap = graph.get_video_capture(current['cam_index'], width=640, height=480)
+        # Boucle de capture et d'envoi
+        while streaming_active:
+            with lock:
+                if mic_idx != current_mic_index:
+                    if stream: stream.close()
+                    break
+
+            audio_data = b'\x00' * CHUNK_SIZE * p.get_sample_size(FORMAT) # Données muettes par défaut
+            if stream and input_device_index is not None:
+                try:
+                    audio_data = stream.read(CHUNK_SIZE)
+                except IOError as e:
+                    # Gérer le buffer overflow ou la déconnexion
+                    print(f"Erreur de lecture audio: {e}. Reconnexion.")
+                    if stream: stream.close()
+                    break # Redémarrer la boucle externe pour relancer le micro
+
+            try:
+                server_socket_audio.sendto(audio_data, (SERVER_IP_STREAM, PORT_STREAM_AUDIO))
+            except Exception as e:
+                print(f"Erreur d'envoi audio: {e}")
+                time.sleep(0.01) # Petite pause en cas d'erreur
+        
+        if stream: stream.close()
+        time.sleep(1) # Petite pause avant de réessayer/changer
+
+# --- Thread de Contrôle TCP ---
+
+def control_server():
+    """Écoute les commandes de contrôle du client via TCP."""
+    global current_camera_index, current_mic_index, streaming_active
+    
+    # Créer le socket TCP
+    control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    control_sock.bind(('0.0.0.0', PORT_CONTROL)) # Écouter sur toutes les interfaces
+    control_sock.listen(1)
+    print(f"\n[Contrôle] Serveur de contrôle en écoute sur le port {PORT_CONTROL}")
+
     try:
-        while True:
-            frame = cap.get_frame()  # numpy array
-            if frame is not None:
-                data = pickle.dumps(frame)
-                conn.sendall(b'V' + struct.pack("Q", len(data)) + data)
-            # ici tu peux ajouter l'audio si tu veux
-            time.sleep(0.03)  # ~30 fps
-    except Exception as e:
-        print("[SERVER] erreur en envoi video/audio:", e)
+        conn, addr = control_sock.accept()
+        print(f"[Contrôle] Connexion établie avec {addr}")
+        
+        while streaming_active:
+            try:
+                command = conn.recv(1024).decode().strip()
+                if not command:
+                    print("[Contrôle] Client déconnecté.")
+                    break
+                
+                parts = command.split(':')
+                cmd_type = parts[0]
+                
+                with lock:
+                    if cmd_type == 'CAM':
+                        try:
+                            new_index = int(parts[1])
+                            if 0 <= new_index < len(AVAILABLE_CAMERAS):
+                                current_camera_index = new_index
+                                response = f"OK:Caméra changée à {AVAILABLE_CAMERAS[new_index]}"
+                            else:
+                                response = f"ERREUR: Index de caméra invalide {new_index}"
+                        except:
+                            response = "ERREUR: Format de commande CAM invalide"
+                    
+                    elif cmd_type == 'MIC':
+                        try:
+                            new_index = int(parts[1])
+                            if 0 <= new_index < len(AVAILABLE_MICS):
+                                current_mic_index = new_index
+                                response = f"OK:Micro changé à {AVAILABLE_MICS[new_index]}"
+                            else:
+                                response = f"ERREUR: Index de micro invalide {new_index}"
+                        except:
+                            response = "ERREUR: Format de commande MIC invalide"
+                    
+                    elif cmd_type == 'LIST':
+                        cam_list = ",".join(f"{i}:{name}" for i, name in enumerate(AVAILABLE_CAMERAS))
+                        mic_list = ",".join(f"{i}:{name}" for i, name in enumerate(AVAILABLE_MICS))
+                        response = f"LIST:CAM={cam_list}|MIC={mic_list}"
+                        
+                    else:
+                        response = "ERREUR: Commande inconnue"
+
+                conn.sendall(response.encode())
+                print(f"[Contrôle] Reçu: {command} -> Envoyé: {response.split(':')[0]}")
+
+            except ConnectionResetError:
+                print("[Contrôle] Client forcé à se déconnecter.")
+                break
+            except Exception as e:
+                print(f"[Contrôle] Erreur de communication: {e}")
+                break
+    
     finally:
-        cap.stop()
+        control_sock.close()
+        streaming_active = False # Arrêter le streaming si le contrôle se termine
 
-def main():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(1)
-    print(f"[SERVER] En attente de connexion sur {HOST}:{PORT} ...")
-    
-    conn, addr = server_socket.accept()
-    print("[SERVER] Connecté au client", addr)
-    
-    # lancer thread pour recevoir les settings
-    threading.Thread(target=recv_settings, args=(conn,), daemon=True).start()
-    
-    # lancer envoi vidéo/audio
-    send_video_audio(conn)
+# --- Fonction principale du serveur ---
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    print(f"--- Serveur de Streaming Multi-Source ---")
+    print(f"IP de streaming: {SERVER_IP_STREAM}")
+    print(f"Port Vidéo (UDP): {PORT_STREAM_VIDEO}")
+    print(f"Port Audio (UDP): {PORT_STREAM_AUDIO}")
+    print(f"Port de Contrôle (TCP): {PORT_CONTROL}\n")
+
+    # Démarrer les threads
+    video_thread = threading.Thread(target=video_streamer)
+    audio_thread = threading.Thread(target=audio_streamer)
+    control_thread = threading.Thread(target=control_server)
+
+    video_thread.start()
+    audio_thread.start()
+    control_thread.start()
+
+    try:
+        # Maintenir le thread principal en vie jusqu'à ce que les threads se terminent
+        control_thread.join()
+    except KeyboardInterrupt:
+        print("\nArrêt du serveur par l'utilisateur.")
+    finally:
+        streaming_active = False
+        # Permettre aux autres threads de s'arrêter
+        video_thread.join(timeout=1)
+        audio_thread.join(timeout=1)
+        print("Serveur arrêté.")
