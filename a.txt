@@ -2,78 +2,50 @@ import cv2
 import socket
 import struct
 import pickle
-import miniupnpc
-import time
 import threading
+import pyaudio
 
-# --- Configuration ---
-HOST = "0.0.0.0"
+# --- CONFIGURATION ---
+CLIENT_IP = "192.168.1.50"  # 🔧 Remplace par l’IP du client (récepteur)
 PORT = 9999
-ANNOUNCE_IP = "93.28.230.141"
-ANNOUNCE_PORT = 5000
 
-# --- UPnP pour récupérer l'IP publique ---
-upnp = miniupnpc.UPnP()
-upnp.discoverdelay = 200
-upnp.discover()
-upnp.selectigd()
-external_ip = upnp.externalipaddress()
-print("Adresse IP publique :", external_ip)
+# --- Connexion socket ---
+print(f"Tentative de connexion au client {CLIENT_IP}:{PORT}...")
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect((CLIENT_IP, PORT))
+print("Connecté au client ✅")
 
-try:
-    upnp.addportmapping(PORT, 'TCP', upnp.lanaddr, PORT, 'PythonCamServer', '')
-    print(f"Port {PORT} mappé via UPnP")
-except Exception as e:
-    print("Erreur mapping UPnP:", e)
-
-# --- Socket TCP pour serveur caméra ---
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind((HOST, PORT))
-server_socket.listen(1)
-print("Serveur prêt sur le port", PORT)
-
-# --- Socket UDP pour envoyer l'IP publique en continu ---
-announce_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# --- Fonction pour envoyer l'IP en boucle ---
-def announce_ip():
-    while True:
-        announce_socket.sendto(external_ip.encode(), (ANNOUNCE_IP, ANNOUNCE_PORT))
-        time.sleep(1)  # envoie toutes les 1 seconde
-
-# Lancement du thread pour l'annonce
-threading.Thread(target=announce_ip, daemon=True).start()
-
-# --- Webcam ---
+# --- Caméra ---
 cap = cv2.VideoCapture(0)
 
-try:
-    while True:
-        print("En attente de connexion client...")
-        conn, addr = server_socket.accept()
-        print("Client connecté:", addr)
+# --- Micro ---
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
 
-        try:
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                data = pickle.dumps(frame)
-                message = struct.pack("Q", len(data)) + data
-                conn.sendall(message)
-        except Exception as e:
-            print("Client déconnecté:", e)
-            conn.close()
-            continue
+p = pyaudio.PyAudio()
+stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
-except KeyboardInterrupt:
-    print("\nArrêt du serveur...")
-
-finally:
-    cap.release()
-    server_socket.close()
+# --- Thread d’envoi ---
+def send_data():
     try:
-        upnp.deleteportmapping(PORT, 'TCP')
-    except:
-        pass
+        while True:
+            # Envoi vidéo
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            data = pickle.dumps(frame)
+            message = struct.pack("Q", len(data)) + data
+            client_socket.sendall(b'V' + message)
+
+            # Envoi audio
+            audio_data = stream.read(CHUNK)
+            audio_msg = struct.pack("H", len(audio_data)) + audio_data
+            client_socket.sendall(b'A' + audio_msg)
+
+    except Exception as e:
+        print("Connexion perdue :", e)
+        client_socket.close()
+
+send_data()
