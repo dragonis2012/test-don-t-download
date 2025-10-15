@@ -135,7 +135,7 @@ def video_streamer():
             cam_idx = current_camera_index
 
         if cam_idx < len(AVAILABLE_CAMERAS) - 1 and cam_idx >= 0:
-            cap = cv2.VideoCapture(cam_idx)
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
             if not cap.isOpened():
                 print(f"Erreur: Impossible d'ouvrir la caméra {cam_idx}. Passage à la source par défaut.")
                 cap = None
@@ -354,3 +354,4 @@ if __name__ == '__main__':
         unmap_ports(PORTS_TO_MAP) 
         
         print("Serveur arrêté.")
+
