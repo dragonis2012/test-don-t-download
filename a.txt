@@ -1,199 +1,83 @@
-# serveur.py
-import cv2
+# a_txt_rewrite.py (remplace a.txt)
 import socket
-import pickle
 import struct
-import time
-import threading
+import pickle
 import json
+import threading
+import time
+from pygrabber.dshow_graph import FilterGraph
 import pyaudio
 
-CLIENT_IP = "93.28.230.141"   # adresse du client récepteur (remplace si besoin)
+HOST = "93.28.230.141"
 PORT = 9999
 
-# audio defaults
+# Audio config
 A_CHUNK = 1024
 A_FORMAT = pyaudio.paInt16
 A_CHANNELS = 1
 A_RATE = 44100
 
-# état partagé
-state = {
-    "cam_index": 0,
-    "mic_index": None,  # None => PyAudio default input device
-    "running": True
-}
-state_lock = threading.Lock()
+p = pyaudio.PyAudio()
+out_stream = p.open(format=A_FORMAT, channels=A_CHANNELS, rate=A_RATE, output=True)
 
-# helper : open camera safely
-def open_camera(idx):
-    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)  # cv2.CAP_DSHOW helps on Windows
-    if not cap.isOpened():
-        cap.release()
-        return None
-    return cap
+# Liste des caméras disponibles
+graph = FilterGraph()
+cams = graph.get_input_devices()
+print("Caméras détectées :", cams)
 
-# helper : open microphone safely
-def open_micro(p, mic_idx):
-    try:
-        if mic_idx is None:
-            stream = p.open(format=A_FORMAT, channels=A_CHANNELS, rate=A_RATE,
-                            input=True, frames_per_buffer=A_CHUNK)
-        else:
-            stream = p.open(format=A_FORMAT, channels=A_CHANNELS, rate=A_RATE,
-                            input=True, frames_per_buffer=A_CHUNK, input_device_index=mic_idx)
-        return stream
-    except Exception as e:
-        return None
+# choix par défaut
+current = {"cam_index": 0, "mic_index": None}
 
-# thread to receive settings (packets starting with 'S')
-def recv_settings_loop(sock):
-    """
-    Protocol: 'S' + struct.pack("H", length) + payload(json utf-8)
-    """
-    try:
-        while True:
-            hdr = sock.recv(1)
+def recv_settings(conn):
+    while True:
+        try:
+            hdr = conn.recv(1)
             if not hdr:
                 break
             if hdr == b'S':
-                lenb = sock.recv(2)
-                if len(lenb) < 2:
+                ldata = conn.recv(2)
+                if not ldata:
                     break
-                payload_len = struct.unpack("H", lenb)[0]
-                payload = b""
-                while len(payload) < payload_len:
-                    chunk = sock.recv(payload_len - len(payload))
-                    if not chunk:
-                        break
-                    payload += chunk
-                try:
-                    obj = json.loads(payload.decode('utf-8'))
-                    with state_lock:
-                        if "cam_index" in obj:
-                            state["cam_index"] = int(obj["cam_index"])
-                        if "mic_index" in obj:
-                            # client may send null -> set None
-                            state["mic_index"] = (None if obj["mic_index"] is None else int(obj["mic_index"]))
-                    print("[SERVER] Nouveaux réglages reçus:", obj)
-                except Exception as e:
-                    print("[SERVER] impossible de parser les settings:", e)
-            else:
-                # ignore unexpected headers here (stream thread consumes V/A)
-                # put back? can't easily; break to force reconnect
-                print("[SERVER] header inattendu dans channel commandes:", hdr)
-                break
-    except Exception as e:
-        print("[SERVER] recv_settings_loop erreur:", e)
+                slen = struct.unpack("H", ldata)[0]
+                payload = conn.recv(slen)
+                obj = json.loads(payload.decode('utf-8'))
+                current['cam_index'] = obj.get('cam_index', 0)
+                current['mic_index'] = obj.get('mic_index', None)
+                print("[SERVER] Settings reçus :", current)
+        except Exception as e:
+            print("[SERVER] recv_settings_loop erreur:", e)
+            break
 
-def send_stream_loop(sock):
-    p = pyaudio.PyAudio()
-    cap = None
-    mic_stream = None
-
+def send_video_audio(conn):
+    # capture caméra via pygrabber
+    cap = graph.get_video_capture(current['cam_index'], width=640, height=480)
     try:
         while True:
-            # ensure devices match current state
-            with state_lock:
-                cam_idx = state["cam_index"]
-                mic_idx = state["mic_index"]
-
-            # (re)open camera if needed
-            if cap is None or (hasattr(cap, 'index') and cap.index != cam_idx):
-                if cap:
-                    try:
-                        cap.release()
-                    except:
-                        pass
-                    cap = None
-                cap = open_camera(cam_idx)
-                if cap is None:
-                    # camera not available, wait and retry
-                    # send pauses to avoid busy loop
-                    time.sleep(0.5)
-                    continue
-
-            # (re)open mic if needed
-            if mic_stream is None:
-                mic_stream = open_micro(p, mic_idx)
-                if mic_stream is None:
-                    print("[SERVER] impossible d'ouvrir le micro (index=", mic_idx, ") -> retry")
-                    time.sleep(0.5)
-                    continue
-
-            # read & send video
-            ret, frame = cap.read()
-            if not ret:
-                # small pause and retry
-                time.sleep(0.01)
-                continue
-            frame_data = pickle.dumps(frame, protocol=4)
-            try:
-                sock.sendall(b'V' + struct.pack("Q", len(frame_data)) + frame_data)
-            except Exception as e:
-                print("[SERVER] erreur en envoi video:", e)
-                break
-
-            # read & send audio
-            try:
-                audio_data = mic_stream.read(A_CHUNK, exception_on_overflow=False)
-            except Exception as e:
-                # erreur micro -> close and let loop reopen
-                print("[SERVER] erreur lecture micro:", e)
-                try:
-                    mic_stream.close()
-                except:
-                    pass
-                mic_stream = None
-                time.sleep(0.1)
-                continue
-            try:
-                sock.sendall(b'A' + struct.pack("H", len(audio_data)) + audio_data)
-            except Exception as e:
-                print("[SERVER] erreur en envoi audio:", e)
-                break
-
-        # sortie de boucle => socket break
-    finally:
-        try:
-            if cap:
-                cap.release()
-        except:
-            pass
-        try:
-            if mic_stream:
-                mic_stream.close()
-        except:
-            pass
-        try:
-            p.terminate()
-        except:
-            pass
-
-# boucle principale : tentatives infinies de connexion
-while True:
-    try:
-        print(f"[SERVER] Tentative de connexion à {CLIENT_IP}:{PORT} ...")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((CLIENT_IP, PORT))
-        s.settimeout(None)
-        print("[SERVER] Connecté au client")
-
-        # lancer thread de réception de settings
-        settings_thread = threading.Thread(target=recv_settings_loop, args=(s,), daemon=True)
-        settings_thread.start()
-
-        # envoyer flux (bloquant jusqu'à erreur)
-        send_stream_loop(s)
-
-        print("[SERVER] connexion perdue, tentative de reconnexion...")
-        try:
-            s.close()
-        except:
-            pass
-        time.sleep(1)
+            frame = cap.get_frame()  # numpy array
+            if frame is not None:
+                data = pickle.dumps(frame)
+                conn.sendall(b'V' + struct.pack("Q", len(data)) + data)
+            # ici tu peux ajouter l'audio si tu veux
+            time.sleep(0.03)  # ~30 fps
     except Exception as e:
-        print("[SERVER] impossible de se connecter:", e)
-        time.sleep(1)
-        continue
+        print("[SERVER] erreur en envoi video/audio:", e)
+    finally:
+        cap.stop()
+
+def main():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((HOST, PORT))
+    server_socket.listen(1)
+    print(f"[SERVER] En attente de connexion sur {HOST}:{PORT} ...")
+    
+    conn, addr = server_socket.accept()
+    print("[SERVER] Connecté au client", addr)
+    
+    # lancer thread pour recevoir les settings
+    threading.Thread(target=recv_settings, args=(conn,), daemon=True).start()
+    
+    # lancer envoi vidéo/audio
+    send_video_audio(conn)
+
+if __name__ == "__main__":
+    main()
